@@ -121,6 +121,7 @@
 #define SFTP_EXT_STATVFS "statvfs@openssh.com"
 #define SFTP_EXT_HARDLINK "hardlink@openssh.com"
 #define SFTP_EXT_FSYNC "fsync@openssh.com"
+#define SFTP_EXT_LSETSTAT "lsetstat@openssh.com"
 
 #define PROTO_VERSION 3
 
@@ -393,6 +394,7 @@ struct sshfs {
 	int ext_statvfs;
 	int ext_hardlink;
 	int ext_fsync;
+	int ext_lsetstat;
 	struct fuse_operations *op;
 
 	/* statistics */
@@ -1724,6 +1726,9 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 			if (strcmp(ext, SFTP_EXT_FSYNC) == 0 &&
 			    strcmp(extdata, "1") == 0)
 				sshfs.ext_fsync = 1;
+			if (strcmp(ext, SFTP_EXT_LSETSTAT) == 0 &&
+			    strcmp(extdata, "1") == 0)
+				sshfs.ext_lsetstat = 1;
 
 			free(ext);
 			free(extdata);
@@ -2785,6 +2790,37 @@ static inline struct sshfs_file *get_sshfs_file(struct fuse_file_info *fi)
 	return (struct sshfs_file *) (uintptr_t) fi->fh;
 }
 
+/*
+ * Attribute changes on a path (no open file): the kernel has already
+ * followed every symlink the caller meant to follow before the request
+ * reaches us, so a path that is a symlink here always means the link
+ * itself. Plain SSH_FXP_SETSTAT follows it again on the server
+ * (utimes()/chown() on the target), which hits the wrong file or fails
+ * with ENOENT when the link dangles (tar extracting symlinks, rsync -a).
+ * OpenSSH's lsetstat@openssh.com is SETSTAT without following; use it
+ * when the server advertised it. Same ATTRS encoding, so callers only
+ * swap the request head and the request type.
+ */
+static void buf_add_setstat_target(struct buffer *buf,
+				   const struct sshfs_file *sf,
+				   const char *path)
+{
+	if (sf != NULL) {
+		buf_add_buf(buf, &sf->handle);
+		return;
+	}
+	if (sshfs.ext_lsetstat)
+		buf_add_string(buf, SFTP_EXT_LSETSTAT);
+	buf_add_path(buf, path);
+}
+
+static uint8_t setstat_type(const struct sshfs_file *sf)
+{
+	if (sf != NULL)
+		return SSH_FXP_FSETSTAT;
+	return sshfs.ext_lsetstat ? SSH_FXP_EXTENDED : SSH_FXP_SETSTAT;
+}
+
 static int sshfs_chmod(const char *path, mode_t mode,
                        struct fuse_file_info *fi)
 {
@@ -2809,6 +2845,10 @@ static int sshfs_chmod(const char *path, mode_t mode,
 	buf_add_uint32(&buf, mode);
 
 	/* FIXME: really needs LSETSTAT extension (debian Bug#640038) */
+	/* Deliberately still plain SETSTAT, unlike utimens/chown: the server
+	   implements lsetstat permissions with fchmodat(AT_SYMLINK_NOFOLLOW),
+	   which glibc < 2.32 rejects with ENOTSUP for every file, not only
+	   symlinks. The kernel never asks us to chmod a symlink anyway. */
 	// Commutes with pending write(), so we can use any connection
 	// if the file is not open.
 	err = sftp_request(get_conn(sf, NULL),
@@ -2846,18 +2886,14 @@ static int sshfs_chown(const char *path, uid_t uid, gid_t gid,
 			return -EPERM;
 
 	buf_init(&buf, 0);
-	if (sf == NULL)
-		buf_add_path(&buf, path);
-	else
-		buf_add_buf(&buf, &sf->handle);
+	buf_add_setstat_target(&buf, sf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_UIDGID);
 	buf_add_uint32(&buf, uid);
 	buf_add_uint32(&buf, gid);
 
 	// Commutes with pending write(), so we can use any connection
 	// if the file is not open.
-	err = sftp_request(get_conn(sf, NULL),
-			   sf == NULL ? SSH_FXP_SETSTAT : SSH_FXP_FSETSTAT,
+	err = sftp_request(get_conn(sf, NULL), setstat_type(sf),
 			   &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
@@ -2920,16 +2956,12 @@ static int sshfs_utimens(const char *path, const struct timespec tv[2],
 	msec = utimens_resolve(&tv[1], cur.st_mtime, now);
 
 	buf_init(&buf, 0);
-	if (sf == NULL)
-		buf_add_path(&buf, path);
-	else
-		buf_add_buf(&buf, &sf->handle);
+	buf_add_setstat_target(&buf, sf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_ACMODTIME);
 	buf_add_uint32(&buf, asec);
 	buf_add_uint32(&buf, msec);
 
-	err = sftp_request(get_conn(sf, path),
-			   sf == NULL ? SSH_FXP_SETSTAT : SSH_FXP_FSETSTAT,
+	err = sftp_request(get_conn(sf, path), setstat_type(sf),
 			   &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
@@ -3887,8 +3919,9 @@ static void usage(const char *progname)
 "    -o disable_hardlink    link(2) will return with errno set to ENOSYS\n"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o contain_symlinks    reject absolute symlinks and symlinks containing ..\n"
-"                           (enabled by default; disable with no_contain_symlinks)\n"
+"                           (disabled by default in this branch)\n"
 "    -o no_contain_symlinks allow all symlink targets including absolute and ..\n"
+"                           (the default here)\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
 "    -o password_stdin      read password from stdin (only for pam_mount!)\n"
@@ -4451,7 +4484,9 @@ int main(int argc, char *argv[])
 	sshfs.max_conns = 1;
 	sshfs.ptyfd = -1;
 	sshfs.dir_cache = 1;
-	sshfs.contain_symlinks = 1;
+	/* Off by default in this branch: our servers are our own machines and
+	   the mounts are full of absolute symlinks that must stay readable. */
+	sshfs.contain_symlinks = 0;
 	sshfs.show_help = 0;
 	sshfs.show_version = 0;
 	sshfs.singlethread = 0;

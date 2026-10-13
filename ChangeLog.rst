@@ -1,3 +1,14 @@
+Unreleased
+----------
+
+* Use the lsetstat@openssh.com extension, when the server offers it, for utimens and chown
+  on a path. Plain SETSTAT follows symlinks on the server, so setting times or owner on a
+  symlink hit the target instead, or failed with ENOENT on a dangling one (tar, rsync -a).
+  chmod stays on SETSTAT: the extension maps it to fchmodat(AT_SYMLINK_NOFOLLOW), which
+  older server libcs reject for every file.
+* contain_symlinks is off by default (branch-local): absolute symlinks stay readable.
+  -o contain_symlinks turns the 3.7.6 behaviour back on.
+
 Release 3.7.6 (2026-05-30)
 --------------------------
 
